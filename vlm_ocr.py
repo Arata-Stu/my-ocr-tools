@@ -21,15 +21,19 @@ DEFAULT_PROMPT = (
     "各カードは、左端の縦長の番号帯、中央の大きな英単語、右側の日本語意味というレイアウトを持ちます。"
     "カラー画像では青い見出し枠に見えますが、白黒PDFでは色ではなくこのレイアウトで判定してください。"
     "見開きページに複数カードが並んでいる場合は、見えているカードをすべて抽出してください。"
+    "見開き画像では、左ページの上から下、次に右ページの上から下の順で返してください。"
     "左側の帯紙・広告、上部の見出し、QRコード、音声マーク、ページ番号は無視してください。"
     "各カードから次の3項目だけ抽出してください: "
     "number=番号帯の単語番号, english=太字の英単語, japanese=日本語意味。"
+    "number はカード左端の番号帯に印刷された数値をそのまま読んでください。"
+    "ページ番号や問題番号やフォーマット例の数字を使ってはいけません。"
     "日本語意味が複数あるときは必ず「、」区切りで1つの文字列にまとめてください。"
     "日本語意味の中に {for} や 《to》 のような英語の補足があれば、その括弧内は削除してください。"
     "品詞記号、発音記号、例文、派生語、関連語、熟語、QRコード、ページ番号は不要です。"
+    "見えていないカードを推測で補わないでください。"
     "長文ページ、会話文、subコラム、Check!!、チェックリスト、補足欄しか写っていない場合は空配列を返してください。"
     "出力はJSON配列を最優先にしてください。各要素は "
-    '{"number":"312","english":"especially","japanese":"特に"} '
+    '{"number":"1","english":"sample","japanese":"例、見本"} '
     "の形にしてください。JSONが難しい場合でも、最低限 `number,english,japanese` または `番号,英単語,日本語` のCSVとして返してください。"
     "説明文やMarkdownコードフェンスは不要です。"
 )
@@ -191,6 +195,28 @@ def normalize_entry(entry: Dict[str, object]) -> Optional[Dict[str, str]]:
         "english": english,
         "japanese": japanese,
     }
+
+
+def sort_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    def sort_key(entry: Dict[str, str]) -> Tuple[int, object]:
+        number = entry.get("number", "")
+        if re.fullmatch(r"\d+", number):
+            return (0, int(number))
+        return (1, number)
+
+    return sorted(entries, key=sort_key)
+
+
+def dedupe_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen_numbers = set()
+    unique_entries: List[Dict[str, str]] = []
+    for entry in entries:
+        number = entry.get("number", "")
+        if not number or number in seen_numbers:
+            continue
+        seen_numbers.add(number)
+        unique_entries.append(entry)
+    return sort_entries(unique_entries)
 
 
 def parse_csv_like_response(cleaned: str) -> List[Dict[str, str]]:
@@ -435,6 +461,21 @@ class MiniCPMVocabularyExtractor:
         image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
         return self.extract_from_image(image)
 
+    def _crop_relative(
+        self,
+        image: Image.Image,
+        left_ratio: float,
+        top_ratio: float,
+        right_ratio: float,
+        bottom_ratio: float,
+    ) -> Image.Image:
+        width, height = image.size
+        left = max(0, min(width - 1, int(round(width * left_ratio))))
+        top = max(0, min(height - 1, int(round(height * top_ratio))))
+        right = max(left + 1, min(width, int(round(width * right_ratio))))
+        bottom = max(top + 1, min(height, int(round(height * bottom_ratio))))
+        return image.crop((left, top, right, bottom))
+
     def _resize_for_ocr(self, image: Image.Image, long_side_limit: int) -> Image.Image:
         width, height = image.size
         long_side = max(width, height)
@@ -447,6 +488,28 @@ class MiniCPMVocabularyExtractor:
             resample=Image.Resampling.LANCZOS,
         )
         return resized
+
+    def _build_ocr_views(self, image: Image.Image) -> List[Tuple[str, Image.Image]]:
+        width, height = image.size
+        aspect_ratio = width / max(height, 1)
+        if aspect_ratio < 1.2:
+            return [("full", image)]
+
+        views = [
+            (
+                "left_page",
+                self._crop_relative(image, 0.15, 0.03, 0.54, 0.98),
+            ),
+            (
+                "right_page",
+                self._crop_relative(image, 0.47, 0.03, 0.985, 0.98),
+            ),
+            (
+                "full_spread",
+                self._crop_relative(image, 0.10, 0.03, 0.985, 0.98),
+            ),
+        ]
+        return views
 
     def _chat_with_image(
         self,
@@ -468,9 +531,12 @@ class MiniCPMVocabularyExtractor:
             max_slice_nums=max_slice_nums,
         )
 
-    def extract_from_image(self, image: Image.Image) -> List[Dict[str, str]]:
-        base_image = ImageOps.exif_transpose(image).convert("RGB")
-        prepared = self._resize_for_ocr(base_image, self.max_image_size)
+    def _extract_rows_and_raw_single_view(
+        self,
+        image: Image.Image,
+        view_label: str,
+    ) -> Tuple[List[Dict[str, str]], str]:
+        prepared = self._resize_for_ocr(image, self.max_image_size)
 
         attempts = [
             (prepared, self.max_slice_nums, f"max_slice_nums={self.max_slice_nums}"),
@@ -494,11 +560,11 @@ class MiniCPMVocabularyExtractor:
             try:
                 response = self._chat_with_image(attempt_image, attempt_slices)
                 if key != (prepared.size, self.max_slice_nums):
-                    print(f"[Info] 省メモリ設定でOCR成功: {label}")
+                    print(f"[Info] {view_label}: 省メモリ設定でOCR成功: {label}")
                 rows, _ = parse_ocr_response(response)
-                return rows
+                return rows, response
             except torch.cuda.OutOfMemoryError:
-                print(f"[Warn] CUDA OOM。{label} で再試行します。")
+                print(f"[Warn] {view_label}: CUDA OOM。{label} で再試行します。")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -506,6 +572,14 @@ class MiniCPMVocabularyExtractor:
             "CUDA OOM が解消できませんでした。"
             " より小さい画像にするか、openbmb/MiniCPM-V-2_6-int4 の利用を検討してください。"
         )
+
+    def extract_from_image(self, image: Image.Image) -> List[Dict[str, str]]:
+        base_image = ImageOps.exif_transpose(image).convert("RGB")
+        rows = []
+        for view_label, view_image in self._build_ocr_views(base_image):
+            view_rows, _ = self._extract_rows_and_raw_single_view(view_image, view_label)
+            rows.extend(view_rows)
+        return dedupe_entries(rows)
 
 
 def save_entries_to_csv(entries: Sequence[Dict[str, str]], output_path: str):
@@ -521,30 +595,14 @@ def extract_entries_and_raw(
     image_path: str,
 ) -> Tuple[List[Dict[str, str]], str]:
     image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
-    base_image = extractor._resize_for_ocr(image, extractor.max_image_size)
+    entries = []
+    raw_sections = []
 
-    attempts = [(base_image, extractor.max_slice_nums)]
-    if extractor.max_slice_nums > 1:
-        attempts.append((base_image, 1))
-    for fallback_size in (1120, 896):
-        resized = extractor._resize_for_ocr(base_image, fallback_size)
-        if resized.size != base_image.size:
-            attempts.append((resized, 1))
+    for view_label, view_image in extractor._build_ocr_views(image):
+        rows, raw = extractor._extract_rows_and_raw_single_view(view_image, view_label)
+        entries.extend(rows)
+        cleaned = strip_code_fence(raw)
+        if cleaned:
+            raw_sections.append(f"[{view_label}]\n{cleaned}")
 
-    tried = set()
-    last_raw = ""
-    for attempt_image, attempt_slices in attempts:
-        key = (attempt_image.size, attempt_slices)
-        if key in tried:
-            continue
-        tried.add(key)
-        try:
-            raw = extractor._chat_with_image(attempt_image, attempt_slices)
-            rows, cleaned = parse_ocr_response(raw)
-            return rows, cleaned
-        except torch.cuda.OutOfMemoryError:
-            last_raw = ""
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    return [], last_raw
+    return dedupe_entries(entries), "\n\n".join(raw_sections)
