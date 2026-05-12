@@ -1,92 +1,51 @@
-import sys
-import torch
-from PIL import Image
+import argparse
+import json
 
-from transformers import (
-    AutoModel,
-    AutoTokenizer,
-    BitsAndBytesConfig
-)
-
-MODEL_ID = "openbmb/MiniCPM-V-2_6"
-
-print("[Info] モデルロード中...")
-
-# ==========================================
-# 4bit量子化
-# ==========================================
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
-)
-
-# ==========================================
-# tokenizer
-# ==========================================
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_ID,
-    trust_remote_code=True
-)
-
-# ==========================================
-# model
-# ==========================================
-model = AutoModel.from_pretrained(
-    MODEL_ID,
-    trust_remote_code=True,
-    device_map="auto",
-    quantization_config=quantization_config,
-    low_cpu_mem_usage=True,
-    attn_implementation="sdpa"
-).eval()
-
-print("[Info] ロード完了")
+from vlm_ocr import DEFAULT_MODEL_ID, MiniCPMVocabularyExtractor, save_entries_to_csv
 
 
-def run_ocr(image_path):
-
-    image = Image.open(image_path).convert("RGB")
-
-    msgs = [
-        {
-            "role": "user",
-            "content": [
-                image,
-                (
-                    "この画像は英単語帳です。"
-                    "番号、英単語、日本語をCSV形式で抽出してください。\n\n"
-                    "番号,英単語,日本語"
-                )
-            ]
-        }
-    ]
-
-    res = model.chat(
-        image=None,
-        msgs=msgs,
-        tokenizer=tokenizer
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="単語帳の単一画像から青枠単語だけをVLMで抽出します。"
     )
+    parser.add_argument("image_path", help="入力画像パス")
+    parser.add_argument(
+        "--output",
+        default="last_result.csv",
+        help="出力CSVパス",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=DEFAULT_MODEL_ID,
+        help="使用するVLMモデルID",
+    )
+    parser.add_argument(
+        "--prompt-path",
+        default="prompts.json",
+        help="抽出プロンプト定義のJSONファイル",
+    )
+    parser.add_argument(
+        "--prompt-key",
+        default="blue_word_cards",
+        help="prompts.json 内のキー",
+    )
+    return parser.parse_args()
 
-    return res
+
+def main():
+    args = parse_args()
+
+    extractor = MiniCPMVocabularyExtractor(
+        model_id=args.model_id,
+        prompt_path=args.prompt_path,
+        prompt_key=args.prompt_key,
+    )
+    entries = extractor.extract_from_path(args.image_path)
+
+    print(json.dumps(entries, ensure_ascii=False, indent=2))
+    save_entries_to_csv(entries, args.output)
+    print(f"[Info] {args.output} に保存しました。")
 
 
 if __name__ == "__main__":
-
-    if len(sys.argv) < 2:
-        print("usage: python test-vlm.py image.png")
-        sys.exit(1)
-
-    img_path = sys.argv[1]
-
-    result = run_ocr(img_path)
-
-    print(result)
-
-    with open(
-        "last_result.csv",
-        "w",
-        encoding="utf-8"
-    ) as f:
-        f.write(result)
+    main()

@@ -1,57 +1,85 @@
-import cv2
+import argparse
 import csv
 import os
-import numpy as np
+import shutil
+import subprocess
+import tempfile
 from collections import Counter
 from typing import Dict, List, Optional
 
+import cv2
+import numpy as np
+
+from vlm_ocr import DEFAULT_MODEL_ID, MiniCPMVocabularyExtractor
+
+
 class WordCardProcessor:
-    def __init__(self, csv_path: str, diff_threshold: float = 5.0):
+    def __init__(
+        self,
+        csv_path: str,
+        extractor: Optional[MiniCPMVocabularyExtractor] = None,
+        diff_threshold: float = 5.0,
+        min_static_samples: int = 2,
+        max_ocr_per_static_segment: int = 2,
+    ):
         self.csv_path = csv_path
-        self.diff_threshold = diff_threshold # 差分の閾値（値が小さいほど「完全に静止」を求める）
-        # 抽出したデータを一時保存する辞書 {番号: {'eng': [候補1, 候補2...], 'jpn': [候補1...]}}
-        self.raw_data: Dict[int, Dict[str, List[str]]] = {} 
+        self.extractor = extractor
+        self.diff_threshold = diff_threshold
+        self.min_static_samples = max(1, min_static_samples)
+        self.max_ocr_per_static_segment = max(1, max_ocr_per_static_segment)
+        self.raw_data: Dict[int, Dict[str, List[str]]] = {}
 
     def load_existing_data(self):
         """リカバリー用：既存のCSVがあれば読み込んでベースにする（Upsert）"""
         if not os.path.exists(self.csv_path):
             return
 
-        with open(self.csv_path, mode='r', encoding='utf-8') as f:
+        with open(self.csv_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    num = int(row['番号'])
-                    # 既存データは確定済みとして、多めに重み付け（ここではダミーで3回分追加）
-                    if row['英単語'] and row['日本語']:
-                        self.raw_data.setdefault(num, {'eng': [], 'jpn': []})
-                        self.raw_data[num]['eng'].extend([row['英単語']] * 3)
-                        self.raw_data[num]['jpn'].extend([row['日本語']] * 3)
-                except ValueError:
+                    num = int(row["番号"])
+                except (KeyError, TypeError, ValueError):
                     continue
+
+                eng = (row.get("英単語") or "").strip()
+                jpn = (row.get("日本語") or row.get("日本語意味") or "").strip()
+                if not eng or not jpn:
+                    continue
+
+                self.raw_data.setdefault(num, {"eng": [], "jpn": []})
+                self.raw_data[num]["eng"].extend([eng] * 3)
+                self.raw_data[num]["jpn"].extend([jpn] * 3)
+
         print(f"[Info] 既存データ {self.csv_path} を読み込みました。")
 
     def _dummy_vlm_predict(self, frame: np.ndarray) -> List[Dict[str, str]]:
         """
-        【モックアップ】ここに本来はQwen-VLなどの推論コードが入ります。
-        今回はテスト用に、ランダムな結果（たまにノイズが混ざる）を返します。
+        VLM未使用時のスモークテスト用。
         """
         import random
+
         results = []
-        # 仮の単語データ
         base_words = {
-            1: ("history", "歴史；経歴"), 2: ("tie", "つながり；を結ぶ"), 
-            3: ("unite", "一体にする"), 4: ("culture", "文化；教養")
+            1: ("history", "歴史；経歴"),
+            2: ("tie", "つながり；ネクタイ；同点；を結ぶ；をつなぐ"),
+            3: ("unite", "一体にする；一つにする"),
+            4: ("culture", "文化；教養；培養"),
         }
-        
-        # 擬似的にフレームごとにばらつき（ノイズ）や抜けを発生させる
+
         for num, (eng, jpn) in base_words.items():
-            if random.random() > 0.8: continue # 20%の確率でその番号を見逃す
-            
-            # 10%の確率で指で隠れた等のノイズが発生する
+            if random.random() > 0.8:
+                continue
+
             extracted_eng = eng if random.random() > 0.1 else eng[:-1] + "x"
-            
-            results.append({"number": str(num), "english": extracted_eng, "japanese": jpn})
+            results.append(
+                {
+                    "number": str(num),
+                    "english": extracted_eng,
+                    "japanese": jpn,
+                }
+            )
+
         return results
 
     def is_frame_static(self, prev_gray: np.ndarray, curr_gray: np.ndarray) -> bool:
@@ -60,18 +88,51 @@ class WordCardProcessor:
         mean_diff = np.mean(diff)
         return mean_diff < self.diff_threshold
 
-    def process_video(self, video_path: str, extract_fps: int = 2):
-        """動画を読み込み、静止フレームをVLM（ダミー）に投げる"""
+    def analyze_frame(self, frame: np.ndarray, sample_label: str):
+        try:
+            if self.extractor is None:
+                vlm_results = self._dummy_vlm_predict(frame)
+            else:
+                vlm_results = self.extractor.extract_from_frame(frame)
+        except Exception as exc:
+            print(f"  -> {sample_label} : OCR失敗 ({exc})")
+            return
+
+        if not vlm_results:
+            print(f"  -> {sample_label} : 対象の単語カードなし")
+            return
+
+        print(f"  -> {sample_label} : {len(vlm_results)} 件の候補を取得")
+
+        for res in vlm_results:
+            try:
+                num = int(str(res["number"]).strip())
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            eng = str(res.get("english", "")).strip()
+            jpn = str(res.get("japanese", "")).strip()
+            if not eng or not jpn:
+                continue
+
+            self.raw_data.setdefault(num, {"eng": [], "jpn": []})
+            self.raw_data[num]["eng"].append(eng)
+            self.raw_data[num]["jpn"].append(jpn)
+
+    def process_video(self, video_path: str, extract_fps: float = 2.0):
+        """動画を読み込み、静止ページに対してVLM OCRを実行する"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"[Error] 動画 {video_path} が開けません。")
             return
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(fps / extract_fps) # 1秒間に何回処理するか
-        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_interval = max(1, int(round(fps / max(extract_fps, 0.1))))
+
         prev_gray = None
         frame_count = 0
+        static_streak = 0
+        ocr_runs_current_segment = 0
 
         print("[Info] 動画の解析を開始します...")
         while True:
@@ -79,33 +140,80 @@ class WordCardProcessor:
             if not ret:
                 break
 
-            # 指定間隔でフレームを処理
             if frame_count % frame_interval == 0:
                 curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
-                # 最初は差分比較できないのでスキップ
+
                 if prev_gray is not None:
                     if self.is_frame_static(prev_gray, curr_gray):
-                        print(f"  -> フレーム {frame_count} : 静止を確認。VLMで解析中...")
-                        
-                        # VLM推論の実行（今回はダミー）
-                        vlm_results = self._dummy_vlm_predict(frame)
-                        
-                        # 結果を raw_data に蓄積
-                        for res in vlm_results:
-                            try:
-                                num = int(res["number"])
-                                self.raw_data.setdefault(num, {'eng': [], 'jpn': []})
-                                self.raw_data[num]['eng'].append(res["english"])
-                                self.raw_data[num]['jpn'].append(res["japanese"])
-                            except ValueError:
-                                continue
+                        static_streak += 1
+                        if (
+                            static_streak >= self.min_static_samples
+                            and ocr_runs_current_segment
+                            < self.max_ocr_per_static_segment
+                        ):
+                            print(
+                                f"  -> フレーム {frame_count} : 静止を確認。OCRで解析中..."
+                            )
+                            self.analyze_frame(frame, f"フレーム {frame_count}")
+                            ocr_runs_current_segment += 1
                     else:
-                        pass # ページめくり等のためスキップ（デバッグ時はprintしてもよい）
+                        static_streak = 0
+                        ocr_runs_current_segment = 0
+
                 prev_gray = curr_gray
+
             frame_count += 1
+
         cap.release()
         print("[Info] 動画の解析が完了しました。")
+
+    def process_pdf(self, pdf_path: str, dpi: int = 200):
+        """PDFをページ画像に変換し、各ページをVLM OCRに投入する"""
+        gs_path = shutil.which("gs")
+        if not gs_path:
+            print("[Error] Ghostscript (gs) が見つかりません。PDFを処理できません。")
+            return
+
+        with tempfile.TemporaryDirectory(prefix="ocr_pdf_") as tmp_dir:
+            output_pattern = os.path.join(tmp_dir, "page-%04d.png")
+            command = [
+                gs_path,
+                "-q",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-sDEVICE=pnggray",
+                f"-r{dpi}",
+                f"-sOutputFile={output_pattern}",
+                pdf_path,
+            ]
+
+            try:
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.decode("utf-8", errors="ignore").strip()
+                print(f"[Error] PDFの画像化に失敗しました: {stderr or exc}")
+                return
+
+            page_files = sorted(
+                [
+                    os.path.join(tmp_dir, name)
+                    for name in os.listdir(tmp_dir)
+                    if name.lower().endswith(".png")
+                ]
+            )
+            if not page_files:
+                print("[Warning] PDFからページ画像を生成できませんでした。")
+                return
+
+            print(f"[Info] PDFの解析を開始します... ({len(page_files)} ページ)")
+            for page_index, page_file in enumerate(page_files, start=1):
+                page_image = cv2.imread(page_file, cv2.IMREAD_COLOR)
+                if page_image is None:
+                    print(f"  -> ページ {page_index} : 画像読み込み失敗")
+                    continue
+                self.analyze_frame(page_image, f"ページ {page_index}")
+            print("[Info] PDFの解析が完了しました。")
 
     def resolve_and_save(self):
         """多数決によるノイズ除去、抜け番検知、CSVへの書き出し"""
@@ -113,73 +221,156 @@ class WordCardProcessor:
             print("[Warning] 保存するデータがありません。")
             return
 
-        # 存在する番号の最小値と最大値を取得
         min_num = min(self.raw_data.keys())
         max_num = max(self.raw_data.keys())
-
         final_data = []
 
-        # 抜け番検知のため、最小から最大まで順番にループ
         for num in range(min_num, max_num + 1):
             if num in self.raw_data:
-                # 多数決で最頻値（最も多く認識された文字列）を採用
-                best_eng = Counter(self.raw_data[num]['eng']).most_common(1)[0][0]
-                best_jpn = Counter(self.raw_data[num]['jpn']).most_common(1)[0][0]
-                
-                # もし候補が割れすぎていたら要確認フラグを立てるロジック等もここに書けます
+                best_eng = Counter(self.raw_data[num]["eng"]).most_common(1)[0][0]
+                best_jpn = Counter(self.raw_data[num]["jpn"]).most_common(1)[0][0]
                 status = ""
             else:
-                # 抜け番の場合
                 best_eng = ""
                 best_jpn = ""
                 status = "[要確認: 番号抜け]"
                 print(f"[Alert] 番号 {num} が動画から見つかりませんでした。")
 
-            final_data.append({
-                "番号": num,
-                "英単語": best_eng,
-                "日本語": best_jpn,
-                "備考": status
-            })
+            final_data.append(
+                {
+                    "番号": num,
+                    "英単語": best_eng,
+                    "日本語": best_jpn,
+                    "備考": status,
+                }
+            )
 
-        # CSVに書き出し
-        with open(self.csv_path, mode='w', encoding='utf-8', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["番号", "英単語", "日本語", "備考"])
+        with open(self.csv_path, mode="w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["番号", "英単語", "日本語", "備考"]
+            )
             writer.writeheader()
             writer.writerows(final_data)
-        
-        print(f"[Success] {self.csv_path} にデータを出力しました！")
+
+        print(f"[Success] {self.csv_path} にデータを出力しました。")
 
 
-# ==========================================
-# 実行スクリプト
-# ==========================================
-if __name__ == "__main__":
-    # 出力するCSVのパス
-    OUTPUT_CSV = "words_list.csv"
-    # テスト用の動画パス（ご自身のスマホで撮影した短い動画を置いてください）
-    VIDEO_PATH = "sample.mp4" 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="単語帳の動画またはPDFから単語番号・英単語・日本語をCSV化します。"
+    )
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        default="sample.mp4",
+        help="入力ファイルパス（動画またはPDF）",
+    )
+    parser.add_argument(
+        "--output",
+        default="words_list.csv",
+        help="出力CSVパス",
+    )
+    parser.add_argument(
+        "--extract-fps",
+        type=float,
+        default=2.0,
+        help="1秒あたり何回サンプリングするか",
+    )
+    parser.add_argument(
+        "--diff-threshold",
+        type=float,
+        default=5.0,
+        help="静止判定の差分閾値",
+    )
+    parser.add_argument(
+        "--min-static-samples",
+        type=int,
+        default=2,
+        help="何サンプル連続で静止ならOCRするか",
+    )
+    parser.add_argument(
+        "--max-ocr-per-static-segment",
+        type=int,
+        default=2,
+        help="同じ静止ページに対して何回までOCRするか",
+    )
+    parser.add_argument(
+        "--pdf-dpi",
+        type=int,
+        default=200,
+        help="PDFを画像化するときのDPI",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=DEFAULT_MODEL_ID,
+        help="使用するVLMモデルID",
+    )
+    parser.add_argument(
+        "--prompt-path",
+        default="prompts.json",
+        help="抽出プロンプト定義のJSONファイル",
+    )
+    parser.add_argument(
+        "--prompt-key",
+        default="blue_word_cards",
+        help="prompts.json 内のキー",
+    )
+    parser.add_argument(
+        "--dummy",
+        action="store_true",
+        help="VLMを使わずダミーOCRで動作確認する",
+    )
+    return parser.parse_args()
 
-    processor = WordCardProcessor(OUTPUT_CSV)
-    
-    # 1. 既存のCSVがあれば読み込む（リカバリー機能）
+
+def infer_input_type(input_path: str) -> str:
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".pdf":
+        return "pdf"
+    return "video"
+
+
+def main():
+    args = parse_args()
+
+    extractor = None
+    if not args.dummy:
+        extractor = MiniCPMVocabularyExtractor(
+            model_id=args.model_id,
+            prompt_path=args.prompt_path,
+            prompt_key=args.prompt_key,
+        )
+
+    processor = WordCardProcessor(
+        csv_path=args.output,
+        extractor=extractor,
+        diff_threshold=args.diff_threshold,
+        min_static_samples=args.min_static_samples,
+        max_ocr_per_static_segment=args.max_ocr_per_static_segment,
+    )
     processor.load_existing_data()
-    
-    # 2. 動画の解析（静止検知とダミーVLM推論によるデータ蓄積）
-    # ※VIDEO_PATHにファイルがないとエラーになりますが、ロジック確認のためダミー実行も可能です
-    if os.path.exists(VIDEO_PATH):
-        processor.process_video(VIDEO_PATH)
-    else:
-        print("[Warning] sample.mp4 が見つかりません。カメラ等のダミーフレームでテスト処理します。")
-        # ダミーフレームを10回投げてテスト
-        dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        for i in range(10):
-            res = processor._dummy_vlm_predict(dummy_frame)
-            for r in res:
-                num = int(r["number"])
-                processor.raw_data.setdefault(num, {'eng': [], 'jpn': []})
-                processor.raw_data[num]['eng'].append(r["english"])
-                processor.raw_data[num]['jpn'].append(r["japanese"])
 
-    # 3. 多数決、抜け番検知、保存
-    processor.resolve_and_save()
+    if os.path.exists(args.input_path):
+        input_type = infer_input_type(args.input_path)
+        if input_type == "pdf":
+            processor.process_pdf(args.input_path, dpi=args.pdf_dpi)
+        else:
+            processor.process_video(args.input_path, extract_fps=args.extract_fps)
+        processor.resolve_and_save()
+        return
+
+    if args.dummy:
+        print(
+            f"[Warning] {args.input_path} が見つかりません。ダミーフレームでスモークテストします。"
+        )
+        dummy_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        for index in range(10):
+            processor.analyze_frame(dummy_frame, sample_label=f"dummy {index + 1}")
+        processor.resolve_and_save()
+        return
+
+    print(f"[Error] 入力ファイルが見つかりません: {args.input_path}")
+
+
+if __name__ == "__main__":
+    main()
