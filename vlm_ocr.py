@@ -1,3 +1,4 @@
+import ast
 import csv
 import io
 import json
@@ -55,6 +56,7 @@ def load_prompt(prompt_path: str, prompt_key: str) -> str:
 
 def strip_code_fence(text: str) -> str:
     cleaned = text.strip()
+    cleaned = re.sub(r"<\|[^|>]+\|>", "", cleaned).strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
         cleaned = re.sub(r"\n?```$", "", cleaned)
@@ -108,6 +110,24 @@ def try_parse_json_fragment(text: str) -> Optional[object]:
             try:
                 return json.loads(fragment)
             except json.JSONDecodeError:
+                continue
+    return None
+
+
+def try_parse_python_literal_fragment(text: str) -> Optional[object]:
+    try:
+        return ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        pass
+
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            fragment = text[start : end + 1]
+            try:
+                return ast.literal_eval(fragment)
+            except (SyntaxError, ValueError):
                 continue
     return None
 
@@ -288,6 +308,46 @@ def parse_key_value_blocks(cleaned: str) -> List[Dict[str, str]]:
     return rows
 
 
+def parse_python_dict_lines(cleaned: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+
+    # Case 1: one dict/list as a Python literal
+    parsed_literal = try_parse_python_literal_fragment(cleaned)
+    if isinstance(parsed_literal, dict):
+        normalized = normalize_entry(parsed_literal)
+        if normalized is not None:
+            return [normalized]
+    if isinstance(parsed_literal, list):
+        literal_rows = [
+            normalize_entry(item) for item in parsed_literal if isinstance(item, dict)
+        ]
+        literal_rows = [row for row in literal_rows if row is not None]
+        if literal_rows:
+            return literal_rows
+
+    # Case 2: newline-delimited Python dict repr
+    for line in cleaned.splitlines():
+        stripped = line.strip().rstrip(",")
+        if not stripped:
+            continue
+        if "{" not in stripped or "}" not in stripped:
+            continue
+
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if end <= start:
+            continue
+
+        fragment = stripped[start : end + 1]
+        parsed = try_parse_python_literal_fragment(fragment)
+        if isinstance(parsed, dict):
+            normalized = normalize_entry(parsed)
+            if normalized is not None:
+                rows.append(normalized)
+
+    return rows
+
+
 def parse_ocr_response(response: str) -> Tuple[List[Dict[str, str]], str]:
     cleaned = strip_code_fence(response)
 
@@ -311,6 +371,10 @@ def parse_ocr_response(response: str) -> Tuple[List[Dict[str, str]], str]:
         return [], cleaned
 
     rows = parse_csv_like_response(cleaned)
+    if rows:
+        return rows, cleaned
+
+    rows = parse_python_dict_lines(cleaned)
     if rows:
         return rows, cleaned
 
