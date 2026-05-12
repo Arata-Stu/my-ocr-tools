@@ -15,6 +15,7 @@ map/
 maps/
 isaac_ros_assets/
 tmp/
+.pip-cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

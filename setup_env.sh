@@ -7,6 +7,9 @@ echo "[Info] CUDA 12.6 を有効化"
 export CUDA_HOME=/usr/local/cuda-12.6
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+export PIP_CACHE_DIR="$(pwd)/.pip-cache"
+
+mkdir -p "$PIP_CACHE_DIR"
 
 echo "[Info] nvcc version"
 nvcc -V
@@ -19,7 +22,13 @@ source env/bin/activate
 
 echo "[Info] pip 更新"
 
-pip install --upgrade pip setuptools wheel
+pip install --upgrade pip wheel "setuptools<81"
+
+echo "[Info] setuptools version"
+python - <<'PY'
+import setuptools
+print(setuptools.__version__)
+PY
 
 echo "[Info] PyTorch install"
 
@@ -34,6 +43,7 @@ pip install -r requirements.txt
 
 echo "[Info] flash-attn install"
 
-MAX_JOBS=1 pip install flash-attn==2.5.8 --no-build-isolation
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=1 \
+  pip install flash-attn==2.5.8 --no-build-isolation --no-cache-dir
 
 echo "[Info] 完了"
