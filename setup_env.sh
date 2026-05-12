@@ -41,9 +41,13 @@ echo "[Info] requirements install"
 
 pip install -r requirements.txt
 
-echo "[Info] flash-attn install"
-
-FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=1 \
-  pip install flash-attn==2.5.8 --no-build-isolation --no-cache-dir
+if [ "${INSTALL_FLASH_ATTN:-0}" = "1" ]; then
+  echo "[Info] flash-attn install"
+  FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=1 \
+    pip install flash-attn==2.5.8 --no-build-isolation --no-cache-dir
+else
+  echo "[Info] flash-attn install をスキップ"
+  echo "[Info] 必要なら INSTALL_FLASH_ATTN=1 bash setup_env.sh を使ってください"
+fi
 
 echo "[Info] 完了"
