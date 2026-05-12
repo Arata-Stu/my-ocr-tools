@@ -7,11 +7,13 @@ from typing import Dict, List, Optional, Sequence
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 DEFAULT_MODEL_ID = "openbmb/MiniCPM-V-2_6"
 DEFAULT_PROMPT_KEY = "blue_word_cards"
+DEFAULT_MAX_SLICE_NUMS = 2
+DEFAULT_MAX_IMAGE_SIZE = 1344
 DEFAULT_PROMPT = (
     "この画像は日本の英単語帳のページです。"
     "抽出対象は、単語カード形式の見出し語だけです。"
@@ -164,30 +166,38 @@ class MiniCPMVocabularyExtractor:
         model_id: str = DEFAULT_MODEL_ID,
         prompt_path: str = "prompts.json",
         prompt_key: str = DEFAULT_PROMPT_KEY,
+        max_slice_nums: int = DEFAULT_MAX_SLICE_NUMS,
+        max_image_size: int = DEFAULT_MAX_IMAGE_SIZE,
     ):
         self.model_id = model_id
         self.prompt = load_prompt(prompt_path, prompt_key)
+        self.max_slice_nums = max(1, int(max_slice_nums))
+        self.max_image_size = max(448, int(max_image_size))
 
         print("[Info] VLM モデルをロード中...")
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_id,
             trust_remote_code=True,
         )
 
+        load_kwargs = {
+            "trust_remote_code": True,
+            "device_map": "auto",
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True,
+            "attn_implementation": "sdpa",
+        }
+        if not self.model_id.endswith("-int4"):
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
         self.model = AutoModel.from_pretrained(
             self.model_id,
-            trust_remote_code=True,
-            device_map="auto",
-            quantization_config=quantization_config,
-            low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
+            **load_kwargs,
         ).eval()
         print("[Info] VLM モデルのロードが完了しました。")
 
@@ -197,10 +207,27 @@ class MiniCPMVocabularyExtractor:
         return self.extract_from_image(image)
 
     def extract_from_path(self, image_path: str) -> List[Dict[str, str]]:
-        image = Image.open(image_path).convert("RGB")
+        image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
         return self.extract_from_image(image)
 
-    def extract_from_image(self, image: Image.Image) -> List[Dict[str, str]]:
+    def _resize_for_ocr(self, image: Image.Image, long_side_limit: int) -> Image.Image:
+        width, height = image.size
+        long_side = max(width, height)
+        if long_side <= long_side_limit:
+            return image
+
+        scale = long_side_limit / long_side
+        resized = image.resize(
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            resample=Image.Resampling.LANCZOS,
+        )
+        return resized
+
+    def _chat_with_image(
+        self,
+        image: Image.Image,
+        max_slice_nums: int,
+    ) -> str:
         msgs = [
             {
                 "role": "user",
@@ -208,12 +235,51 @@ class MiniCPMVocabularyExtractor:
             }
         ]
 
-        response = self.model.chat(
+        return self.model.chat(
             image=None,
             msgs=msgs,
             tokenizer=self.tokenizer,
+            use_image_id=False,
+            max_slice_nums=max_slice_nums,
         )
-        return parse_ocr_response(response)
+
+    def extract_from_image(self, image: Image.Image) -> List[Dict[str, str]]:
+        base_image = ImageOps.exif_transpose(image).convert("RGB")
+        prepared = self._resize_for_ocr(base_image, self.max_image_size)
+
+        attempts = [
+            (prepared, self.max_slice_nums, f"max_slice_nums={self.max_slice_nums}"),
+        ]
+
+        if self.max_slice_nums > 1:
+            attempts.append((prepared, 1, "max_slice_nums=1"))
+
+        for fallback_size in (1120, 896):
+            resized = self._resize_for_ocr(prepared, fallback_size)
+            if resized.size != prepared.size:
+                attempts.append((resized, 1, f"max_slice_nums=1, long_side<={fallback_size}"))
+
+        tried = set()
+        for attempt_image, attempt_slices, label in attempts:
+            key = (attempt_image.size, attempt_slices)
+            if key in tried:
+                continue
+            tried.add(key)
+
+            try:
+                response = self._chat_with_image(attempt_image, attempt_slices)
+                if key != (prepared.size, self.max_slice_nums):
+                    print(f"[Info] 省メモリ設定でOCR成功: {label}")
+                return parse_ocr_response(response)
+            except torch.cuda.OutOfMemoryError:
+                print(f"[Warn] CUDA OOM。{label} で再試行します。")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        raise RuntimeError(
+            "CUDA OOM が解消できませんでした。"
+            " より小さい画像にするか、openbmb/MiniCPM-V-2_6-int4 の利用を検討してください。"
+        )
 
 
 def save_entries_to_csv(entries: Sequence[Dict[str, str]], output_path: str):

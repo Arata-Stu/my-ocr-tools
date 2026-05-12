@@ -1,7 +1,13 @@
 import argparse
 import json
 
-from vlm_ocr import DEFAULT_MODEL_ID, MiniCPMVocabularyExtractor, save_entries_to_csv
+from vlm_ocr import (
+    DEFAULT_MAX_IMAGE_SIZE,
+    DEFAULT_MAX_SLICE_NUMS,
+    DEFAULT_MODEL_ID,
+    MiniCPMVocabularyExtractor,
+    save_entries_to_csv,
+)
 
 
 def parse_args():
@@ -29,6 +35,18 @@ def parse_args():
         default="blue_word_cards",
         help="prompts.json 内のキー",
     )
+    parser.add_argument(
+        "--max-slice-nums",
+        type=int,
+        default=DEFAULT_MAX_SLICE_NUMS,
+        help="MiniCPM-V に渡す画像スライス上限",
+    )
+    parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=DEFAULT_MAX_IMAGE_SIZE,
+        help="OCR前に画像の長辺をこの値以下へ縮小する",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +57,8 @@ def main():
         model_id=args.model_id,
         prompt_path=args.prompt_path,
         prompt_key=args.prompt_key,
+        max_slice_nums=args.max_slice_nums,
+        max_image_size=args.max_image_size,
     )
     entries = extractor.extract_from_path(args.image_path)
 

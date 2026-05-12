@@ -10,7 +10,12 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from vlm_ocr import DEFAULT_MODEL_ID, MiniCPMVocabularyExtractor
+from vlm_ocr import (
+    DEFAULT_MAX_IMAGE_SIZE,
+    DEFAULT_MAX_SLICE_NUMS,
+    DEFAULT_MODEL_ID,
+    MiniCPMVocabularyExtractor,
+)
 
 
 class WordCardProcessor:
@@ -306,6 +311,18 @@ def parse_args():
         help="使用するVLMモデルID",
     )
     parser.add_argument(
+        "--max-slice-nums",
+        type=int,
+        default=DEFAULT_MAX_SLICE_NUMS,
+        help="MiniCPM-V に渡す画像スライス上限",
+    )
+    parser.add_argument(
+        "--max-image-size",
+        type=int,
+        default=DEFAULT_MAX_IMAGE_SIZE,
+        help="OCR前に画像の長辺をこの値以下へ縮小する",
+    )
+    parser.add_argument(
         "--prompt-path",
         default="prompts.json",
         help="抽出プロンプト定義のJSONファイル",
@@ -339,6 +356,8 @@ def main():
             model_id=args.model_id,
             prompt_path=args.prompt_path,
             prompt_key=args.prompt_key,
+            max_slice_nums=args.max_slice_nums,
+            max_image_size=args.max_image_size,
         )
 
     processor = WordCardProcessor(
