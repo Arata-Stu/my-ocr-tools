@@ -2,7 +2,7 @@ import csv
 import io
 import json
 import re
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -19,15 +19,18 @@ DEFAULT_PROMPT = (
     "抽出対象は、単語カード形式の見出し語だけです。"
     "各カードは、左端の縦長の番号帯、中央の大きな英単語、右側の日本語意味というレイアウトを持ちます。"
     "カラー画像では青い見出し枠に見えますが、白黒PDFでは色ではなくこのレイアウトで判定してください。"
+    "見開きページに複数カードが並んでいる場合は、見えているカードをすべて抽出してください。"
+    "左側の帯紙・広告、上部の見出し、QRコード、音声マーク、ページ番号は無視してください。"
     "各カードから次の3項目だけ抽出してください: "
     "number=番号帯の単語番号, english=太字の英単語, japanese=日本語意味。"
     "日本語意味が複数あるときは必ず「、」区切りで1つの文字列にまとめてください。"
     "日本語意味の中に {for} や 《to》 のような英語の補足があれば、その括弧内は削除してください。"
     "品詞記号、発音記号、例文、派生語、関連語、熟語、QRコード、ページ番号は不要です。"
     "長文ページ、会話文、subコラム、Check!!、チェックリスト、補足欄しか写っていない場合は空配列を返してください。"
-    "出力はJSON配列のみ。各要素は "
+    "出力はJSON配列を最優先にしてください。各要素は "
     '{"number":"312","english":"especially","japanese":"特に"} '
-    "の形にしてください。説明文やMarkdownコードフェンスは不要です。"
+    "の形にしてください。JSONが難しい場合でも、最低限 `number,english,japanese` または `番号,英単語,日本語` のCSVとして返してください。"
+    "説明文やMarkdownコードフェンスは不要です。"
 )
 
 
@@ -56,6 +59,57 @@ def strip_code_fence(text: str) -> str:
         cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
         cleaned = re.sub(r"\n?```$", "", cleaned)
     return cleaned.strip()
+
+
+def normalize_field_name(name: str) -> str:
+    key = re.sub(r"[\s_\-　]", "", name.strip().lower())
+    mapping = {
+        "number": "number",
+        "no": "number",
+        "num": "number",
+        "番号": "number",
+        "単語番号": "number",
+        "英単語番号": "number",
+        "english": "english",
+        "word": "english",
+        "term": "english",
+        "英単語": "english",
+        "単語": "english",
+        "見出し語": "english",
+        "japanese": "japanese",
+        "meaning": "japanese",
+        "meanings": "japanese",
+        "日本語": "japanese",
+        "日本語意味": "japanese",
+        "意味": "japanese",
+        "和訳": "japanese",
+    }
+    return mapping.get(key, key)
+
+
+def canonicalize_entry(raw: Dict[str, object]) -> Dict[str, object]:
+    normalized: Dict[str, object] = {}
+    for key, value in raw.items():
+        normalized[normalize_field_name(str(key))] = value
+    return normalized
+
+
+def try_parse_json_fragment(text: str) -> Optional[object]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            fragment = text[start : end + 1]
+            try:
+                return json.loads(fragment)
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def remove_english_annotations(text: str) -> str:
@@ -101,6 +155,7 @@ def normalize_japanese_meaning(text: str) -> str:
 
 
 def normalize_entry(entry: Dict[str, object]) -> Optional[Dict[str, str]]:
+    entry = canonicalize_entry(entry)
     try:
         number = str(entry["number"]).strip()
         english = str(entry["english"]).strip()
@@ -118,13 +173,125 @@ def normalize_entry(entry: Dict[str, object]) -> Optional[Dict[str, str]]:
     }
 
 
-def parse_ocr_response(response: str) -> List[Dict[str, str]]:
+def parse_csv_like_response(cleaned: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+
+    candidates = [cleaned]
+    if "|" in cleaned:
+        markdown_lines = []
+        for line in cleaned.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.fullmatch(r"\|?[\s:\-]+\|?[\s:\-\|]*", stripped):
+                continue
+            if "|" in stripped:
+                markdown_lines.append(stripped.strip("|"))
+        if markdown_lines:
+            candidates.append("\n".join(markdown_lines))
+
+    for candidate in candidates:
+        reader = csv.DictReader(io.StringIO(candidate))
+        if reader.fieldnames:
+            mapped = [normalize_field_name(field) for field in reader.fieldnames if field]
+            if {"number", "english", "japanese"}.issubset(set(mapped)):
+                for row in reader:
+                    if not row:
+                        continue
+                    canonical_row = {}
+                    for key, value in row.items():
+                        if key is None:
+                            continue
+                        canonical_row[normalize_field_name(key)] = value or ""
+                    normalized = normalize_entry(canonical_row)
+                    if normalized is not None:
+                        rows.append(normalized)
+                if rows:
+                    return rows
+
+        # Headerless CSV lines such as `1,history,歴史、経歴`
+        for delimiter in (",", "\t"):
+            tmp_rows = []
+            for line in candidate.splitlines():
+                stripped = line.strip().strip("|")
+                if not stripped:
+                    continue
+                parts = [part.strip() for part in stripped.split(delimiter)]
+                if len(parts) < 3:
+                    continue
+                if not re.fullmatch(r"\d+", parts[0]):
+                    continue
+                number = parts[0]
+                english = parts[1]
+                japanese = delimiter.join(parts[2:]).strip()
+                normalized = normalize_entry(
+                    {
+                        "number": number,
+                        "english": english,
+                        "japanese": japanese,
+                    }
+                )
+                if normalized is not None:
+                    tmp_rows.append(normalized)
+            if tmp_rows:
+                return tmp_rows
+
+    return []
+
+
+def parse_key_value_blocks(cleaned: str) -> List[Dict[str, str]]:
+    rows = []
+    current: Dict[str, str] = {}
+
+    line_pattern = re.compile(
+        r"^(number|english|japanese|番号|英単語|日本語|意味)\s*[:：]\s*(.+)$",
+        re.IGNORECASE,
+    )
+    compact_pattern = re.compile(
+        r"(?:number|番号)\s*[:：]\s*(?P<number>\d+).*?"
+        r"(?:english|英単語)\s*[:：]\s*(?P<english>[^,，;；]+).*?"
+        r"(?:japanese|日本語|意味)\s*[:：]\s*(?P<japanese>.+)$",
+        re.IGNORECASE,
+    )
+
+    for line in [line.strip(" -*\t") for line in cleaned.splitlines() if line.strip()]:
+        compact_match = compact_pattern.search(line)
+        if compact_match:
+            normalized = normalize_entry(compact_match.groupdict())
+            if normalized is not None:
+                rows.append(normalized)
+            continue
+
+        match = line_pattern.match(line)
+        if not match:
+            if current and len(current) >= 3:
+                normalized = normalize_entry(current)
+                if normalized is not None:
+                    rows.append(normalized)
+                current = {}
+            continue
+
+        key = normalize_field_name(match.group(1))
+        value = match.group(2).strip()
+        current[key] = value
+        if {"number", "english", "japanese"}.issubset(current.keys()):
+            normalized = normalize_entry(current)
+            if normalized is not None:
+                rows.append(normalized)
+            current = {}
+
+    if current and {"number", "english", "japanese"}.issubset(current.keys()):
+        normalized = normalize_entry(current)
+        if normalized is not None:
+            rows.append(normalized)
+
+    return rows
+
+
+def parse_ocr_response(response: str) -> Tuple[List[Dict[str, str]], str]:
     cleaned = strip_code_fence(response)
 
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        parsed = None
+    parsed = try_parse_json_fragment(cleaned)
 
     if isinstance(parsed, dict):
         maybe_entries = parsed.get("entries")
@@ -133,31 +300,25 @@ def parse_ocr_response(response: str) -> List[Dict[str, str]]:
 
     if isinstance(parsed, list):
         rows = [normalize_entry(row) for row in parsed if isinstance(row, dict)]
-        return [row for row in rows if row is not None]
+        normalized_rows = [row for row in rows if row is not None]
+        return normalized_rows, cleaned
 
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     if not lines:
-        return []
+        return [], cleaned
 
     if len(lines) == 1 and lines[0] == "[]":
-        return []
+        return [], cleaned
 
-    reader = csv.DictReader(io.StringIO(cleaned))
-    rows = []
-    for row in reader:
-        if not row:
-            continue
-        normalized = normalize_entry(
-            {
-                "number": row.get("number", ""),
-                "english": row.get("english", ""),
-                "japanese": row.get("japanese", ""),
-            }
-        )
-        if normalized is not None:
-            rows.append(normalized)
+    rows = parse_csv_like_response(cleaned)
+    if rows:
+        return rows, cleaned
 
-    return rows
+    rows = parse_key_value_blocks(cleaned)
+    if rows:
+        return rows, cleaned
+
+    return [], cleaned
 
 
 class MiniCPMVocabularyExtractor:
@@ -270,7 +431,8 @@ class MiniCPMVocabularyExtractor:
                 response = self._chat_with_image(attempt_image, attempt_slices)
                 if key != (prepared.size, self.max_slice_nums):
                     print(f"[Info] 省メモリ設定でOCR成功: {label}")
-                return parse_ocr_response(response)
+                rows, _ = parse_ocr_response(response)
+                return rows
             except torch.cuda.OutOfMemoryError:
                 print(f"[Warn] CUDA OOM。{label} で再試行します。")
                 if torch.cuda.is_available():
@@ -288,3 +450,37 @@ def save_entries_to_csv(entries: Sequence[Dict[str, str]], output_path: str):
         writer.writeheader()
         for entry in entries:
             writer.writerow(entry)
+
+
+def extract_entries_and_raw(
+    extractor: "MiniCPMVocabularyExtractor",
+    image_path: str,
+) -> Tuple[List[Dict[str, str]], str]:
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    base_image = extractor._resize_for_ocr(image, extractor.max_image_size)
+
+    attempts = [(base_image, extractor.max_slice_nums)]
+    if extractor.max_slice_nums > 1:
+        attempts.append((base_image, 1))
+    for fallback_size in (1120, 896):
+        resized = extractor._resize_for_ocr(base_image, fallback_size)
+        if resized.size != base_image.size:
+            attempts.append((resized, 1))
+
+    tried = set()
+    last_raw = ""
+    for attempt_image, attempt_slices in attempts:
+        key = (attempt_image.size, attempt_slices)
+        if key in tried:
+            continue
+        tried.add(key)
+        try:
+            raw = extractor._chat_with_image(attempt_image, attempt_slices)
+            rows, cleaned = parse_ocr_response(raw)
+            return rows, cleaned
+        except torch.cuda.OutOfMemoryError:
+            last_raw = ""
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return [], last_raw

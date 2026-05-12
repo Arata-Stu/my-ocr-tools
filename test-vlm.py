@@ -6,6 +6,7 @@ from vlm_ocr import (
     DEFAULT_MAX_SLICE_NUMS,
     DEFAULT_MODEL_ID,
     MiniCPMVocabularyExtractor,
+    extract_entries_and_raw,
     save_entries_to_csv,
 )
 
@@ -47,6 +48,11 @@ def parse_args():
         default=DEFAULT_MAX_IMAGE_SIZE,
         help="OCR前に画像の長辺をこの値以下へ縮小する",
     )
+    parser.add_argument(
+        "--raw-output",
+        default="last_result_raw.txt",
+        help="モデルの生出力を保存するパス",
+    )
     return parser.parse_args()
 
 
@@ -60,11 +66,16 @@ def main():
         max_slice_nums=args.max_slice_nums,
         max_image_size=args.max_image_size,
     )
-    entries = extractor.extract_from_path(args.image_path)
+    entries, raw_response = extract_entries_and_raw(extractor, args.image_path)
 
     print(json.dumps(entries, ensure_ascii=False, indent=2))
     save_entries_to_csv(entries, args.output)
+    with open(args.raw_output, "w", encoding="utf-8") as f:
+        f.write(raw_response)
     print(f"[Info] {args.output} に保存しました。")
+    print(f"[Info] {args.raw_output} に生出力を保存しました。")
+    if not entries:
+        print("[Warn] 抽出件数が 0 です。生出力を確認してください。")
 
 
 if __name__ == "__main__":
